@@ -16,8 +16,6 @@ from momentfm.models.layers.revin import RevIN
 from momentfm.utils.masking import Masking
 from momentfm.utils.utils import (
     NamespaceWithDefaults,
-    get_anomaly_criterion,
-    get_huggingface_model_dimensions,
 )
 
 SUPPORTED_HUGGINGFACE_MODELS = [
@@ -90,6 +88,33 @@ class ForecastingHead(nn.Module):
         x = self.linear(x)
         x = self.dropout(x)
         return x
+    
+
+class ReconstructionDetectionHead(nn.Module):
+    def __init__(
+        self,
+        d_model: int = 768,
+        patch_len: int = 8,
+        head_dropout: float = 0.1,
+        orth_gain: float = 1.41,
+    ):
+        super().__init__()
+        self.dropout = nn.Dropout(head_dropout)
+        self.rec_head = nn.Linear(d_model, patch_len)
+        self.det_head = nn.Linear(d_model, patch_len)
+
+        if orth_gain is not None:
+            torch.nn.init.orthogonal_(self.rec_head.weight, gain=orth_gain)
+            self.rec_head.bias.data.zero_()
+    
+    def forward(self, x):
+        rec_x = self.rec_head(self.dropout(x))
+        rec_x = rec_x.flatten(start_dim=2, end_dim=3)
+        x = torch.mean(x, dim=1)
+        x = self.dropout(x)
+        y = self.det_head(x)
+        y = y.flatten(start_dim=1, end_dim=2)
+        return rec_x, y
 
 
 class MOMENT(nn.Module):
@@ -199,6 +224,13 @@ class MOMENT(nn.Module):
             )
         elif task_name == TASKS.EMBED:
             return nn.Identity()
+        elif task_name == TASKS.ANOMALY_DETECTION:
+            return ReconstructionDetectionHead(
+                self.config.d_model,
+                self.config.patch_len,
+                self.config.getattr("head_dropout", 0.1),
+                self.config.getattr("orth_gain", 1.41),
+            )
         else:
             raise NotImplementedError(f"Task {task_name} not implemented.")
 
@@ -412,19 +444,62 @@ class MOMENT(nn.Module):
         *,
         x_enc: torch.Tensor,
         input_mask: torch.Tensor = None,
-        anomaly_criterion: str = "mse",
+        mask: torch.Tensor = None,
         **kwargs,
     ) -> TimeseriesOutputs:
-        outputs = self.reconstruct(x_enc=x_enc, input_mask=input_mask)
-        self.anomaly_criterion = get_anomaly_criterion(anomaly_criterion)
+        if mask is None:
+            mask = torch.ones_like(input_mask)
+        
+        batch_size, n_channels, _ = x_enc.shape
+        x_enc = self.normalizer(x=x_enc, mask=mask * input_mask, mode="norm")
 
-        anomaly_scores = self.anomaly_criterion(x_enc, outputs.reconstruction)
+        x_enc = self.tokenizer(x=x_enc)
+        enc_in = self.patch_embedding(x_enc, mask=mask)
+
+        n_patches = enc_in.shape[2]
+        enc_in = enc_in.reshape(
+            (batch_size * n_channels, n_patches, self.config.d_model)
+        )
+        # [batch_size * n_channels x n_patches x d_model]
+
+        patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
+        attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0).to(
+            x_enc.device
+        )
+
+        n_tokens = 0
+        if "prompt_embeds" in kwargs:
+            prompt_embeds = kwargs["prompt_embeds"].to(x_enc.device)
+
+            if isinstance(prompt_embeds, nn.Embedding):
+                prompt_embeds = prompt_embeds.weight.data.unsqueeze(0)
+
+            n_tokens = prompt_embeds.shape[1]
+
+            enc_in = self._cat_learned_embedding_to_input(prompt_embeds, enc_in)
+            attention_mask = self._extend_attention_mask(attention_mask, n_tokens)
+
+        if self.config.transformer_type == "encoder_decoder":
+            outputs = self.encoder(
+                inputs_embeds=enc_in,
+                decoder_inputs_embeds=enc_in,
+                attention_mask=attention_mask,
+            )
+        else:
+            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
+        enc_out = outputs.last_hidden_state
+        enc_out = enc_out[:, n_tokens:, :]
+
+        enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
+        # [batch_size x n_channels x n_patches x d_model]
+
+        rec_x, logits = self.head(enc_out)  # [batch_size x n_channels x seq_len]
+        dec_out = self.normalizer(x=rec_x, mode="denorm")
 
         return TimeseriesOutputs(
             input_mask=input_mask,
-            reconstruction=outputs.reconstruction,
-            anomaly_scores=anomaly_scores,
-            metadata={"anomaly_criterion": anomaly_criterion},
+            reconstruction=dec_out,
+            logits=logits,
         )
 
     def forecast(
@@ -587,6 +662,8 @@ class MOMENT(nn.Module):
             return self.forecast(x_enc=x_enc, input_mask=input_mask, **kwargs)
         elif self.task_name == TASKS.CLASSIFICATION:
             return self.classify(x_enc=x_enc, input_mask=input_mask, **kwargs)
+        elif self.task_name == TASKS.ANOMALY_DETECTION:
+            return self.detect_anomalies(x_enc=x_enc, input_mask=input_mask, **kwargs)
         else:
             raise NotImplementedError(f"Task {self.task_name} not implemented.")
 
